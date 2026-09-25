@@ -55,7 +55,7 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 | shard | 分片（512KB）：分片区间、每片只回源一次；Range 只回源需要的分片（片内、跨片、末尾、越界 416）；部分缓存后只补缺的分片；边界文件（整 2 片、1 片多 1 字节、小于 1 片、空文件）；源站不支持 Range；404；HEAD；不缓存的文件不分片；缓存部分分片后源站换成同样大小的新版本不拼接；修改分片大小只对新文件生效；关闭分片后旧文件仍可命中 |
 | shard302 | 分片 + 302 跟随：跳到大文件后按分片回源、每片都重新跟随；各种 Range；多跳、超上限；本域名绝对地址；目标不支持 Range、目标 404；HEAD；跳到外网大文件（阿里云镜像）和 httpbin 小文件（越界 Range 返回 416 的不规范源站） |
 | share | 共享缓存域名：两个域名互相命中、回源用各自的配置；Range；从任一域名提交 URL 刷新 / 目录刷新，另一个域名都更新；取消共享后各自缓存 |
-| stats | 统计：发一批组成已知的请求（HIT / MISS、共享域名、404 / 206 / 416 / 302、HEAD / POST、10MB 文件、客户端中途断开），窗口内再做一次 URL 刷新和预热。ClickHouse 里按域名 / 方法 / 状态码 / 缓存状态 / 是否中断分组的请求数与实际一致；刷新预热不计入；节点、设备、域名组 ID、协议正确；回源层单独记录；计费流量等于客户端收到的字节数乘以 `billing_coef`；耗时合理。api 的 request_count（含 5 分钟粒度、按域名组、共享域名）、hit_rate（含 HIT / MISS 流量和流量命中率）、status_code_ratio、error_rate、client_abort_rate、region_isp_distribution、traffic、bandwidth、ttfb、request_time 与实际或 ClickHouse 一致 |
+| stats | 统计：发一批组成已知的请求（HIT / MISS、共享域名、404 / 206 / 416 / 302、HEAD / POST、10MB 文件、客户端中途断开），窗口内再做一次 URL 刷新和预热。ClickHouse 里按域名 / 方法 / 状态码 / 缓存状态 / 是否中断分组的请求数与实际一致；刷新预热不计入；节点、设备、域名组 ID、协议正确；回源层单独记录；计费流量等于客户端收到的字节数乘以 `billing_coef`；耗时合理。api 的 request_count（含 5 分钟粒度、按域名组、共享域名）、hit_rate（含 HIT / MISS 流量和流量命中率）、status_code_ratio、error_rate、client_abort_rate、region_isp_distribution、traffic、bandwidth、ttfb、request_time 与实际或 ClickHouse 一致；排行接口 domain_top、node_top（含 layer=source）与上面的接口一致 |
 
 stats 组的做法：统计按分钟聚合，脚本等到新的一分钟开始才发请求，时间窗口按分钟对齐，窗口内只有本组的请求。所以执行期间不能有其它程序访问 `HOST` / `SHARE_HOST`。发完请求后等数据写进 ClickHouse，再多等 12 秒（每个 nginx worker 至少再上报一轮），这样多算的请求也会被发现。这一组约 2 分钟。
 

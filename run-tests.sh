@@ -928,6 +928,19 @@ test_stats() {
 	check "ttfb: 首字节时间合计与 ClickHouse 一致" "$(echo "$d" | jq '[.ttfb_list[].total_ttfb_ms // 0] | add')" "$ttfb"
 	d=$(stat_api request_time)
 	check "request_time: 请求耗时合计与 ClickHouse 一致" "$(echo "$d" | jq '[.request_time_list[].total_request_time_ms // 0] | add')" "$rt"
+
+	# 排行: 与上面各接口同一口径
+	local n4 n5
+	read -r n4 n5 <<<"$(awk -F'\t' -v h=$HOST '$1 == h {c = substr($3, 1, 1); n[c]++} END{print n[4] + 0, n[5] + 0}' $T/stats.tsv)"
+	d=$(stat_api domain_top "domain=$HOST")
+	check "domain_top: 请求数 $nh, 4xx $n4, 5xx $n5, 中断 1" \
+		"$(echo "$d" | jq -r '.domain_top_list[0] | "\(.request_count) \(.http_4xx_count) \(.http_5xx_count) \(.client_abort_count)"')" "$nh $n4 $n5 1"
+	check "domain_top: 平均首包 = 首包时间合计 / 请求数" \
+		"$(near "$(echo "$d" | jq '.domain_top_list[0].average_ttfb_ms')" "$(awk -v t="$ttfb" -v n="$nh" 'BEGIN{printf "%.12f", t / n}')" 1e-9)" ok
+	d=$(stat_api node_top "domain=$HOST")
+	check "node_top: 边缘层只有 $EDGE_NODE, 请求数 $nh" "$(echo "$d" | jq -r '[.node_top_list[] | "\(.node_name):\(.request_count)"] | join(" ")')" "$EDGE_NODE:$nh"
+	d=$(stat_api node_top "domain=$HOST&layer=source")
+	check "node_top(layer=source): 回源只有 $ORIGIN_NODE" "$(echo "$d" | jq -r '[.node_top_list[].node_name] | join(" ")')" "$ORIGIN_NODE"
 }
 
 # ===========================================================================
