@@ -1,6 +1,6 @@
 # arescdn-e2e
 
-AresCDN 端到端测试：从边缘层发请求，经过回源层到测试源站，验证 edge、cache、cache-manager、api、dispatcher 配合后的实际行为。
+AresCDN 端到端测试：从边缘层发请求，经过回源层到测试源站，验证 edge、cache、cache-manager、api、dispatcher 配合后的实际行为；stats 组再验证统计链路（cache-manager → Kafka → arescdn-metric-consumer → ClickHouse → api 统计接口）。
 
 ```
 curl(控制面机器) ──> 边缘层节点 ──> 回源层节点 ──> 测试源站(控制面机器 :8081)
@@ -29,9 +29,9 @@ sudo ./setup.sh
 sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 ```
 
-只跑其中几组：`sudo ./run-tests.sh shard shard302`。完整跑一遍约 20 分钟，大部分时间在等配置生效。
+只跑其中几组：`sudo ./run-tests.sh shard shard302`。完整跑一遍约 22 分钟，大部分时间在等配置生效。
 
-依赖：`curl`、`jq`、`python3`、`docker compose`。部分用例会访问外网：httpbin.org、mirrors.aliyun.com。
+依赖：`curl`、`jq`、`python3`、`docker compose`。部分用例会访问外网：httpbin.org、mirrors.aliyun.com。stats 组要求本机能 `docker exec` 进 ClickHouse 容器（`CLICKHOUSE_CONTAINER`）。
 
 ## 测试环境
 
@@ -43,6 +43,7 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
   - 每个响应带 `X-Origin-Seq`（全局递增），同一 URL 两次序号相同说明命中了缓存。
   - 访问日志 `origin/logs/access.log` 记录来源 IP、Host、Range，脚本据此统计回源次数和分片区间。
 - 脚本会通过 API 修改 `HOST` 的 302 跟随次数、分片大小，以及 `SHARE_HOST` 的共享缓存域名；每组结束时恢复本组的改动，退出时恢复默认（跟随、分片关闭，共享缓存域名为 `HOST`）。
+- 统计里的流量是计费流量：每个请求 `floor(发出的字节数 × billing_coef)`。api 创建域名组时 `billing_coef` 默认为 1.05，所以统计流量比实际多 5%。
 - 配置从修改到所有节点进程生效要等缓存过期（cache-manager 5 秒，edge 进程内和节点共享内存各 5 秒）。脚本探测到新配置生效后，再等 11 秒才继续。
 
 ## 测试内容
@@ -54,6 +55,11 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 | shard | 分片（512KB）：分片区间、每片只回源一次；Range 只回源需要的分片（片内、跨片、末尾、越界 416）；部分缓存后只补缺的分片；边界文件（整 2 片、1 片多 1 字节、小于 1 片、空文件）；源站不支持 Range；404；HEAD；不缓存的文件不分片；缓存部分分片后源站换成同样大小的新版本不拼接；修改分片大小只对新文件生效；关闭分片后旧文件仍可命中 |
 | shard302 | 分片 + 302 跟随：跳到大文件后按分片回源、每片都重新跟随；各种 Range；多跳、超上限；本域名绝对地址；目标不支持 Range、目标 404；HEAD；跳到外网大文件（阿里云镜像）和 httpbin 小文件（越界 Range 返回 416 的不规范源站） |
 | share | 共享缓存域名：两个域名互相命中、回源用各自的配置；Range；从任一域名提交 URL 刷新 / 目录刷新，另一个域名都更新；取消共享后各自缓存 |
+| stats | 统计：发一批组成已知的请求（HIT / MISS、共享域名、404 / 206 / 416 / 302、HEAD / POST、10MB 文件、客户端中途断开），窗口内再做一次 URL 刷新和预热。ClickHouse 里按域名 / 方法 / 状态码 / 缓存状态 / 是否中断分组的请求数与实际一致；刷新预热不计入；节点、设备、域名组 ID、协议正确；回源层单独记录；计费流量等于客户端收到的字节数乘以 `billing_coef`；耗时合理。api 的 request_count（含 5 分钟粒度、按域名组、共享域名）、hit_rate、status_code_ratio、error_rate、client_abort_rate、region_isp_distribution、traffic、bandwidth、ttfb、request_time 与实际或 ClickHouse 一致 |
+
+stats 组的做法：统计按分钟聚合，脚本等到新的一分钟开始才发请求，时间窗口按分钟对齐，窗口内只有本组的请求。所以执行期间不能有其它程序访问 `HOST` / `SHARE_HOST`。发完请求后等数据写进 ClickHouse，再多等 12 秒（每个 nginx worker 至少再上报一轮），这样多算的请求也会被发现。这一组约 2 分钟。
+
+stats 组没有覆盖：https / QUIC（测试域名没有配证书，本机 curl 不支持 HTTP/3）、IPv6（环境没有）、`billing/export`（按月统计全部流量，无法隔离出本组的请求），以及 cache-manager、Kafka、ClickHouse 重启时的数据丢失和恢复。
 
 另有两项只打印现象（INFO），不计入通过或失败：
 

@@ -7,6 +7,7 @@
 #   shard    分片
 #   shard302 分片 + 302 跟随
 #   share    共享缓存域名(SHARE_HOST 共享 HOST 的缓存)
+#   stats    统计: edge -> cache-manager -> Kafka -> metric-consumer -> ClickHouse -> api 统计接口
 #   不带参数时执行全部.
 #
 # 链路: 本机 curl -> 边缘层节点(EDGE) -> 回源层节点(ORIGIN_LAYER_IP) -> 本机测试源站 :8081
@@ -31,7 +32,7 @@ API=$BASE/tools/cdnapi.sh
 DIR=$BASE/origin
 LOG=$DIR/logs/access.log
 RUN=$(date +%Y%m%d%H%M%S)
-TEST_GROUPS=${*:-basic follow shard shard302 share}
+TEST_GROUPS=${*:-basic follow shard shard302 share stats}
 T=$(mktemp -d)
 
 PASS=0
@@ -759,6 +760,166 @@ test_share() {
 }
 
 # ===========================================================================
+# 统计: edge 每个 worker 按分钟聚合, 每 10 秒上报本机 cache-manager -> Kafka -> metric-consumer -> ClickHouse t_cdn_metrics.
+# 本组从新的一分钟开始发请求, 窗口内只有本组的请求(期间不能有其它程序访问 HOST / SHARE_HOST), 所以可以精确比对.
+CK_CONTAINER=${CLICKHOUSE_CONTAINER:-arescdn-clickhouse}
+STAT_TZ=${STAT_TZ:-Asia/Shanghai} # api 统计接口的时区(系统设置 arescdn_time_zone, 默认 Asia/Shanghai)
+
+# ck: 在 ClickHouse 容器里执行 stdin 中的查询, 输出 TSV
+ck() { docker exec -i "$CK_CONTAINER" sh -c 'clickhouse-client --password "$CLICKHOUSE_PASSWORD" -d arescdn --format TSV'; }
+
+# sreq 域名 方法 路径 [curl 参数...]: 发请求, 把实际结果追加到 $T/stats.tsv:
+#   域名 方法 状态码 X-Cache-Status 是否中断 字节数(响应头+响应体) 耗时(毫秒)
+# --raw: 不解分块编码, 字节数包含分块的长度行, 与服务端的 bytes_sent 一致
+sreq() {
+	local host=$1 method=$2 path=$3 w abort=0
+	shift 3
+	case $method in
+	GET) ;;
+	HEAD) set -- -I "$@" ;;
+	*) set -- -X "$method" "$@" ;;
+	esac
+	: >$T/hdr
+	w=$(curl -s --raw -m 60 -o /dev/null -D $T/hdr -H "Host: $host" \
+		-w '%{http_code} %{size_header} %{size_download} %{time_total}' "$@" "http://$EDGE$path")
+	[ $? = 28 ] && abort=1 # 超时: 客户端主动断开
+	set -- $w
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$method" "$1" "$(hdr X-Cache-Status)" $abort \
+		$(($2 + $3)) "$(awk -v t="$4" 'BEGIN{printf "%d", t * 1000 + 0.5}')" >>$T/stats.tsv
+}
+# stats_expect: 实际的请求数, 按 域名 方法 状态码 缓存状态 是否中断 分组
+stats_expect() { awk -F'\t' -v OFS='\t' '{n[$1 OFS $2 OFS $3 OFS $4 OFS $5]++} END{for (k in n) print k, n[k]}' $T/stats.tsv | LC_ALL=C sort; }
+# stats_n [域名]: 实际的请求数
+stats_n() { awk -F'\t' -v h="${1:-}" 'h == "" || $1 == h' $T/stats.tsv | wc -l; }
+# stats_where [域名]: 本组时间窗口内边缘层的记录
+stats_where() {
+	local d=${1:+"'$1'"}
+	echo "layer = 'edge' AND domain IN (${d:-"'$HOST', '$SHARE_HOST'"}) AND time >= toDateTime($ST_S) AND time < toDateTime($ST_E)"
+}
+stats_ck_ge() { [ "$(ck <<<"SELECT sum(request_count) FROM t_cdn_metrics WHERE $(stats_where)")" -ge "$1" ] 2>/dev/null; }
+
+# stat_api 接口 [查询参数]: 查统计接口, 时间范围为本组的窗口, 输出 data
+api_time() { TZ=$STAT_TZ date -d "@$1" '+%Y-%m-%d%%20%H:%M:%S'; }
+stat_api() {
+	$API GET "/api/cdn/v1/statistics/$1?start_time=$(api_time $ST_S)&end_time=$(api_time $ST_E)&${2:-domain=$HOST&granularity=1min}" | jq -c .data
+}
+# billing_coef 域名组ID: 计费系数, 没有设置时为 1
+billing_coef() { $API GET /api/cdn/v1/domaingroups | jq -r --arg id "$1" '.data.domain_group_list[] | select(.unique_id == $id) | .billing_coef // 1'; }
+# near 实际 期望 允许误差: 输出 ok 或差值
+near() { awk -v a="$1" -v b="$2" -v e="$3" 'BEGIN{d = a - b; if (d < 0) d = -d; if (d <= e) print "ok"; else printf "实际 %.10g, 期望 %.10g\n", a, b}'; }
+
+test_stats() {
+	section "统计: 发请求"
+	# 等到新的一分钟再开始, 窗口 [ST_S, ST_E) 按分钟对齐
+	sleep $((61 - $(date +%s) % 60))
+	ST_S=$(($(date +%s) / 60 * 60))
+	: >$T/stats.tsv
+	local U="/dyn/st?r=$RUN" id1 id2 F=st-preheat-$RUN.txt
+	sreq $HOST GET "$U"
+	sreq $HOST GET "$U"
+	sreq $HOST GET "$U"
+	sreq $SHARE_HOST GET "$U" # 共享缓存: 命中 HOST 的缓存, 记在 SHARE_HOST 下
+	sreq $HOST GET "/nocache/st?r=$RUN"
+	sreq $HOST GET "/nocache/st?r=$RUN"
+	sreq $HOST GET "/static/not-exist-$RUN.bin"
+	sreq $HOST GET "/static/10m.bin?r=$RUN-st"
+	sreq $HOST GET "/static/10m.bin?r=$RUN-st" -H "Range: bytes=0-99"
+	sreq $HOST GET "/static/10m.bin?r=$RUN-st" -H "Range: bytes=20000000-20000100"
+	sreq $HOST GET "/302/rel?r=$RUN-st"
+	sreq $HOST HEAD "/static/small.txt?r=$RUN-st"
+	sreq $HOST POST "/echo?r=$RUN-st" -d a=1
+	sreq $HOST GET "/static/10m.bin?r=$RUN-abort" --limit-rate 100k -m 2 # 下载 2 秒后断开
+	check "发出的请求: 状态码 / 缓存状态 / 是否中断" \
+		"$(cut -f3-5 $T/stats.tsv | tr '\t\n' ' ' | sed 's/ $//')" \
+		"200 MISS 0 200 HIT 0 200 HIT 0 200 HIT 0 200 MISS 0 200 MISS 0 404 * 0 200 MISS 0 206 HIT 0 416 * 0 302 * 0 200 * 0 200 * 0 200 MISS 1"
+
+	# 窗口内做一次 URL 刷新和预热, 节点上的 PURGE / PREHEAT 请求不应计入统计
+	echo "preheat-$RUN" >$DIR/static/$F
+	id1=$(submit_task refresh "{\"type\":\"file\",\"data_list\":[\"http://$HOST$U\"]}")
+	id2=$(submit_task preheat "{\"data_list\":[\"http://$HOST/static/$F\"]}")
+	task_done refresh "$id1"
+	task_done preheat "$id2"
+	check "窗口内执行了 URL 刷新和预热" "$(task_status refresh "$id1") $(task_status preheat "$id2")" "Success Success"
+	ST_E=$((($(date +%s) / 60 + 1) * 60))
+
+	section "统计: ClickHouse"
+	local n nh ns
+	n=$(stats_n)
+	nh=$(stats_n $HOST)
+	ns=$(stats_n $SHARE_HOST)
+	WAIT_TRIES=30 wait_until "指标写入 ClickHouse" stats_ck_ge $n
+	sleep 12 # 每个 worker 至少再上报一轮: 多算的请求这时也会出现
+	check "按 域名/方法/状态码/缓存状态/是否中断 分组的请求数与实际一致($n 个)" \
+		"$(same "$(ck <<<"SELECT domain, method, status_code, cache_status, client_abort, sum(request_count)
+			FROM t_cdn_metrics WHERE $(stats_where) GROUP BY 1, 2, 3, 4, 5" | LC_ALL=C sort)" "$(stats_expect)")" ok
+	check "刷新和预热不计入(窗口内没有 PURGE / PREHEAT)" \
+		"$(ck <<<"SELECT count() FROM t_cdn_metrics WHERE method IN ('PURGE', 'PREHEAT') AND time >= toDateTime($ST_S) AND time < toDateTime($ST_E)")" 0
+	check "边缘层: 节点 $EDGE_NODE, 设备 cdn$EDGE_NODE-*" \
+		"$(ck <<<"SELECT DISTINCT node_name, device_name FROM t_cdn_metrics WHERE $(stats_where)" | tr '\t\n' '  ' | sed 's/ $//')" \
+		"$EDGE_NODE cdn$EDGE_NODE-*"
+	check "域名组 ID: $HOST 为 $DG, $SHARE_HOST 为 $SHARE_DG" \
+		"$(ck <<<"SELECT DISTINCT domain, cdn_id FROM t_cdn_metrics WHERE $(stats_where)" | LC_ALL=C sort | tr '\t\n' '  ' | sed 's/ $//')" \
+		"$(printf '%s %s\n' $HOST $DG $SHARE_HOST $SHARE_DG | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+	check "协议 http, IP 版本 ipv4" \
+		"$(ck <<<"SELECT DISTINCT protocol, ip_version FROM t_cdn_metrics WHERE $(stats_where)" | tr '\t\n' '  ' | sed 's/ $//')" "http ipv4"
+	check "回源层的请求记在 $ORIGIN_NODE, layer=origin(不计入边缘层)" \
+		"$(ck <<<"SELECT DISTINCT node_name, layer FROM t_cdn_metrics WHERE layer != 'edge' AND domain IN ('$HOST', '$SHARE_HOST')
+			AND time >= toDateTime($ST_S) AND time < toDateTime($ST_E)" | tr '\t\n' '  ' | sed 's/ $//')" "$ORIGIN_NODE origin"
+
+	# 字节数和耗时不含中断的请求: 服务端发出的字节数和结束时间与客户端看到的不同.
+	# 统计的是计费流量: 每个请求 floor(发出的字节数 x 域名组的 billing_coef), api 创建域名组时默认 1.05
+	local ckb cb rt ttfb cms hc sc
+	hc=$(billing_coef $DG)
+	sc=$(billing_coef $SHARE_DG)
+	ckb=$(ck <<<"SELECT sum(billing_bytes_sent_sum) FROM t_cdn_metrics WHERE $(stats_where) AND client_abort = 0")
+	cb=$(awk -F'\t' -v h=$HOST -v hc="$hc" -v sc="$sc" '$5 == 0 {s += int($6 * ($1 == h ? hc : sc))} END{print s}' $T/stats.tsv)
+	check "计费流量(不含中断的请求) = 每个请求客户端收到的字节数 x billing_coef($HOST $hc, $SHARE_HOST $sc)" "$ckb" "$cb"
+	read -r rt ttfb <<<"$(ck <<<"SELECT sum(request_time_ms_sum), sum(ttfb_sum) FROM t_cdn_metrics WHERE $(stats_where) AND client_abort = 0")"
+	cms=$(awk -F'\t' '$5 == 0 {s += $7} END{print s}' $T/stats.tsv)
+	check "耗时(不含中断的请求): 0 < 首字节时间合计 <= 请求耗时合计 <= 客户端耗时合计" \
+		"$(awk -v t="$ttfb" -v r="$rt" -v c="$cms" -v n="$n" 'BEGIN{print (0 < r && t <= r && r <= c + 2 * n) ? "ok" : "首字节 " t ", 请求 " r ", 客户端 " c}')" ok
+
+	section "统计: api 接口($HOST, 只统计边缘层)"
+	local d bytes
+	d=$(stat_api request_count)
+	check "request_count: 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
+	d=$(stat_api request_count "domain=$SHARE_HOST&granularity=1min")
+	check "request_count($SHARE_HOST): 合计 $ns" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$ns"
+	d=$(stat_api request_count "domain_group_unique_id=$DG&granularity=1min")
+	check "request_count(按域名组 $DG): 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
+	d=$(stat_api request_count "domain=$HOST&granularity=5min")
+	check "request_count(5 分钟粒度): 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
+
+	d=$(stat_api hit_rate)
+	check "hit_rate: HIT / MISS 数" "$(echo "$d" | jq -r '[([.hit_rate_list[].hit_count // 0] | add), ([.hit_rate_list[].miss_count // 0] | add)] | join(" ")')" \
+		"$(awk -F'\t' -v h=$HOST '$1 == h && $4 == "HIT" {a++} $1 == h && $4 == "MISS" {b++} END{print a + 0, b + 0}' $T/stats.tsv)"
+	d=$(stat_api status_code_ratio)
+	check "status_code_ratio: 各状态码请求数" "$(echo "$d" | jq -r '[.status_code_ratio_list[] | "\(.status_code):\(.request_count)"] | sort | join(" ")')" \
+		"$(awk -F'\t' -v h=$HOST '$1 == h {n[$3]++} END{for (c in n) print c ":" n[c]}' $T/stats.tsv | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+	d=$(stat_api error_rate)
+	check "error_rate: 2xx / 4xx / 5xx 数" \
+		"$(echo "$d" | jq -r '[([.error_rate_list[].http_2xx_count // 0] | add), ([.error_rate_list[].http_4xx_count // 0] | add), ([.error_rate_list[].http_5xx_count // 0] | add)] | join(" ")')" \
+		"$(awk -F'\t' -v h=$HOST '$1 == h {c = substr($3, 1, 1); n[c]++} END{print n[2] + 0, n[4] + 0, n[5] + 0}' $T/stats.tsv)"
+	d=$(stat_api client_abort_rate)
+	check "client_abort_rate: 中断 1 个, 合计 $nh" \
+		"$(echo "$d" | jq -r '[([.client_abort_rate_list[].client_abort_count // 0] | add), ([.client_abort_rate_list[].total_requests // 0] | add)] | join(" ")')" "1 $nh"
+	d=$(stat_api region_isp_distribution)
+	check "region_isp_distribution: 合计 $nh" "$(echo "$d" | jq .total_requests)" "$nh"
+
+	bytes=$(ck <<<"SELECT sum(billing_bytes_sent_sum) FROM t_cdn_metrics WHERE $(stats_where $HOST)")
+	d=$(stat_api traffic)
+	check "traffic: 与 ClickHouse 的字节数一致" "$(near "$(echo "$d" | jq '[.traffic_list[].traffic_gb // 0] | add * 1073741824')" "$bytes" 1)" ok
+	d=$(stat_api bandwidth)
+	check "bandwidth: 字节数 x 8 / 60 秒(Gbps, 保留 10 位小数)" \
+		"$(near "$(echo "$d" | jq '[.bandwidth_list[].bandwidth // 0] | add')" "$(awk -v b="$bytes" 'BEGIN{printf "%.12f", b * 8 / 60 / 1e9}')" 3e-10)" ok
+	read -r rt ttfb <<<"$(ck <<<"SELECT sum(request_time_ms_sum), sum(ttfb_sum) FROM t_cdn_metrics WHERE $(stats_where $HOST)")"
+	d=$(stat_api ttfb)
+	check "ttfb: 首字节时间合计与 ClickHouse 一致" "$(echo "$d" | jq '[.ttfb_list[].total_ttfb_ms // 0] | add')" "$ttfb"
+	d=$(stat_api request_time)
+	check "request_time: 请求耗时合计与 ClickHouse 一致" "$(echo "$d" | jq '[.request_time_list[].total_request_time_ms // 0] | add')" "$rt"
+}
+
+# ===========================================================================
 echo "AresCDN 核心功能测试 run=$RUN edge=$EDGE host=$HOST groups=[$TEST_GROUPS]"
 
 section "准备: 关闭 302 跟随和分片"
@@ -772,6 +933,7 @@ for g in $TEST_GROUPS; do
 	shard) test_shard ;;
 	shard302) test_shard302 ;;
 	share) test_share ;;
+	stats) test_stats ;;
 	*) echo "未知的组: $g" && exit 2 ;;
 	esac
 done
