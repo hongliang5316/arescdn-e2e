@@ -1,0 +1,10 @@
+services:
+  origin-test:
+    image: openresty/openresty:1.27.1.2-alpine
+    container_name: arescdn-origin-test
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./static:/data/static:ro
+      - ./logs:/logs
