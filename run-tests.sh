@@ -884,7 +884,7 @@ test_stats() {
 		"$(awk -v t="$ttfb" -v r="$rt" -v c="$cms" -v n="$n" 'BEGIN{print (0 < r && t <= r && r <= c + 2 * n) ? "ok" : "首字节 " t ", 请求 " r ", 客户端 " c}')" ok
 
 	section "统计: api 接口($HOST, 只统计边缘层)"
-	local d bytes
+	local d bytes hb mb
 	d=$(stat_api request_count)
 	check "request_count: 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
 	d=$(stat_api request_count "domain=$SHARE_HOST&granularity=1min")
@@ -897,6 +897,13 @@ test_stats() {
 	d=$(stat_api hit_rate)
 	check "hit_rate: HIT / MISS 数" "$(echo "$d" | jq -r '[([.hit_rate_list[].hit_count // 0] | add), ([.hit_rate_list[].miss_count // 0] | add)] | join(" ")')" \
 		"$(awk -F'\t' -v h=$HOST '$1 == h && $4 == "HIT" {a++} $1 == h && $4 == "MISS" {b++} END{print a + 0, b + 0}' $T/stats.tsv)"
+	read -r hb mb <<<"$(ck <<<"SELECT sumIf(billing_bytes_sent_sum, cache_status = 'HIT'), sumIf(billing_bytes_sent_sum, cache_status = 'MISS')
+		FROM t_cdn_metrics WHERE $(stats_where $HOST)")"
+	check "hit_rate: HIT / MISS 流量与 ClickHouse 一致" \
+		"$(near "$(echo "$d" | jq '[.hit_rate_list[].hit_traffic_gb // 0] | add * 1073741824')" "$hb" 1) $(near "$(echo "$d" | jq '[.hit_rate_list[].miss_traffic_gb // 0] | add * 1073741824')" "$mb" 1)" "ok ok"
+	check "hit_rate: 每个点的流量命中率 = HIT 流量 / (HIT + MISS 流量)" \
+		"$(echo "$d" | jq '[.hit_rate_list[] | select(.hit_traffic_gb != null) | (.hit_traffic_gb + .miss_traffic_gb) as $t
+			| ((if $t > 0 then .hit_traffic_gb / $t * 100 else 0 end) - .traffic_hit_rate) | (. < 1e-9 and . > -1e-9)] | all')" true
 	d=$(stat_api status_code_ratio)
 	check "status_code_ratio: 各状态码请求数" "$(echo "$d" | jq -r '[.status_code_ratio_list[] | "\(.status_code):\(.request_count)"] | sort | join(" ")')" \
 		"$(awk -F'\t' -v h=$HOST '$1 == h {n[$3]++} END{for (c in n) print c ":" n[c]}' $T/stats.tsv | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
