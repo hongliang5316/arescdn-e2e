@@ -863,8 +863,12 @@ test_stats() {
 	check "协议 http, IP 版本 ipv4" \
 		"$(ck <<<"SELECT DISTINCT protocol, ip_version FROM t_cdn_metrics WHERE $(stats_where)" | tr '\t\n' '  ' | sed 's/ $//')" "http ipv4"
 	check "回源层的请求记在 $ORIGIN_NODE, layer=origin(不计入边缘层)" \
-		"$(ck <<<"SELECT DISTINCT node_name, layer FROM t_cdn_metrics WHERE layer != 'edge' AND domain IN ('$HOST', '$SHARE_HOST')
+		"$(ck <<<"SELECT DISTINCT node_name, layer FROM t_cdn_metrics WHERE layer NOT IN ('edge', 'source') AND domain IN ('$HOST', '$SHARE_HOST')
 			AND time >= toDateTime($ST_S) AND time < toDateTime($ST_E)" | tr '\t\n' '  ' | sed 's/ $//')" "$ORIGIN_NODE origin"
+	# 回源(最后一层节点向源站发出的请求)由回源端口上报, layer=source
+	check "回源记在 $ORIGIN_NODE, layer=source" \
+		"$(ck <<<"SELECT DISTINCT node_name, layer FROM t_cdn_metrics WHERE layer = 'source' AND domain IN ('$HOST', '$SHARE_HOST')
+			AND time >= toDateTime($ST_S) AND time < toDateTime($ST_E)" | tr '\t\n' '  ' | sed 's/ $//')" "$ORIGIN_NODE source"
 
 	# 字节数和耗时不含中断的请求: 服务端发出的字节数和结束时间与客户端看到的不同.
 	# 统计的是计费流量: 每个请求 floor(发出的字节数 x 域名组的 billing_coef), api 创建域名组时默认 1.05
