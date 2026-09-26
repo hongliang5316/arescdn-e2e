@@ -88,7 +88,7 @@ ssh ubuntu 'cat /root/git/arestech/arescdn-e2e/drill/drill.sh' | bash -s -- all
 | layer2-down | 停掉回源层节点的 nginx | 已缓存的照常命中；没缓存的 2 秒内返回 502；恢复后 200 |
 | cache-manager-down | 停掉边缘层节点的 cache-manager 20 秒 | 请求照常，edge 继续用旧配置 |
 | redis-down | 停掉控制面的 Redis 20 秒 | 请求照常，两层都继续用旧配置 |
-| meta-corrupt | 缓存一个文件，等 LRU 索引写盘后，改坏它 meta 里的响应头，重启 cache | cache 读不出响应头（内部错误）时断开连接，nginx 换设备重试；只有 1 台设备时返回 502；PURGE 后恢复 |
+| meta-corrupt | 缓存一个文件，等 LRU 索引写盘后，改坏它 meta 里的响应头，重启 cache | cache 读盘时发现 meta 损坏，淘汰后回源重新缓存（MISS），之后正常命中（cache prerelease-13 起；之前是一直报内部错误，只有 1 台设备时一直 502） |
 
 meta-corrupt 要等 LRU 写盘：cache 每 60 秒把 LRU 索引写盘一次，关闭时不写；写盘前重启的话，新进程不认识这个文件，会直接当作未命中重新拉取。
 

@@ -11,9 +11,10 @@
 #   layer2-down         回源层节点整个挂了(nginx 停掉)
 #   cache-manager-down  边缘层节点的 cache-manager 挂了
 #   redis-down          控制面的 Redis 挂了
-#   meta-corrupt        边缘层节点上一个缓存对象的 meta 损坏
+#   meta-corrupt        边缘层节点上一个缓存对象的 meta 损坏(cache 应淘汰后回源)
 #
 # 会短暂停止服务: 不要在有真实流量、或者 e2e / arescdn-load 运行时执行.
+# 脚本里的 ssh 都带 -n: 通过管道把脚本交给 bash 时, ssh 会读走标准输入里还没执行的脚本.
 # 每个场景结束时恢复; 中途退出时由 EXIT 钩子恢复.
 set -u
 
@@ -73,16 +74,16 @@ trap restore_all EXIT
 
 # req 路径: 从控制面机器经边缘层请求, 输出 "状态码 缓存状态 耗时(秒)"
 req() {
-	ssh $CTRL_HOST "curl -s -o /dev/null -D - -m 30 -w 'TIME %{time_total}\n' -H 'Host: $HOST' 'http://$EDGE_IP$1'" |
+	ssh -n $CTRL_HOST "curl -s -o /dev/null -D - -m 30 -w 'TIME %{time_total}\n' -H 'Host: $HOST' 'http://$EDGE_IP$1'" |
 		tr -d '\r' | awk '/^HTTP/{c = $2} tolower($1) == "x-cache-status:"{s = $2} /^TIME/{t = $2} END{print (c ? c : "-"), (s ? s : "-"), t}'
 }
 code() { req "$1" | cut -d' ' -f1; }
 # attempts 路径: 边缘层 nginx 最近一次处理这个路径时向 cache 请求了几次($upstream_addr 里的地址数)
 attempts() {
-	ssh $EDGE_HOST "sudo grep -F '$1' /data/log/nginx/cdn-access.log | tail -1" |
+	ssh -n $EDGE_HOST "sudo grep -F '$1' /data/log/nginx/cdn-access.log | tail -1" |
 		awk -F'\t' '{print split($(NF-7), a, ", ")}'
 }
-svc() { ssh "$1" "sudo systemctl $2 $3 && sleep 2" >/dev/null; }
+svc() { ssh -n "$1" "sudo systemctl $2 $3 && sleep 2" >/dev/null; }
 
 # ===========================================================================
 drill_cache_down() {
@@ -127,12 +128,12 @@ drill_cache_manager_down() {
 
 drill_redis_down() {
 	section "Redis 挂了($CTRL_HOST 的 $REDIS_CONTAINER)"
-	on_exit "ssh $CTRL_HOST 'sudo docker start $REDIS_CONTAINER' >/dev/null"
-	ssh $CTRL_HOST "sudo docker stop $REDIS_CONTAINER" >/dev/null
+	on_exit "ssh -n $CTRL_HOST 'sudo docker start $REDIS_CONTAINER' >/dev/null"
+	ssh -n $CTRL_HOST "sudo docker stop $REDIS_CONTAINER" >/dev/null
 	info "等 $STALE_WAIT_SECS 秒, 超过 cache-manager 和 edge 的配置缓存时间"
 	sleep $STALE_WAIT_SECS
 	check "没缓存的请求仍然正常(两层都用旧配置)" "$(code "/static/small.txt?r=drill-redis-$RUN")" 200
-	ssh $CTRL_HOST "sudo docker start $REDIS_CONTAINER" >/dev/null
+	ssh -n $CTRL_HOST "sudo docker start $REDIS_CONTAINER" >/dev/null
 	restored
 	sleep 3
 	check "Redis 恢复后正常" "$(code "/static/small.txt?r=drill-redis-after-$RUN")" 200
@@ -141,28 +142,27 @@ drill_redis_down() {
 drill_meta_corrupt() {
 	section "缓存对象的 meta 损坏($EDGE_HOST)"
 	local p="/static/small.txt?r=drill-meta-$RUN" m
-	ssh $EDGE_HOST "sudo touch /tmp/drill-meta-marker"
+	ssh -n $EDGE_HOST "sudo touch /tmp/drill-meta-marker"
 	sleep 1
 	code "$p" >/dev/null
 	check "准备: 边缘层已缓存一个文件" "$(req "$p" | cut -d' ' -f1-2)" "200 HIT"
-	m=$(ssh $EDGE_HOST "sudo find /data/cache -name meta -newer /tmp/drill-meta-marker")
+	m=$(ssh -n $EDGE_HOST "sudo find /data/cache -name meta -newer /tmp/drill-meta-marker")
 	check "找到这个文件的 meta(1 个)" "$(echo "$m" | grep -c .)" 1
 	[ "$(echo "$m" | grep -c .)" = 1 ] || return
 	# cache 每 60 秒把 LRU 索引写盘一次, 关闭时不写. 写盘前重启的话, 新进程不认识这个文件, 直接当作未命中
 	info "等 LRU 索引写盘(最多 65 秒), 否则重启后 cache 不认识这个文件"
-	ssh $EDGE_HOST "for i in \$(seq 1 65); do [ -n \"\$(sudo find /data/cache -maxdepth 2 -name lru_db -newer /tmp/drill-meta-marker)\" ] && exit 0; sleep 1; done; exit 1"
+	ssh -n $EDGE_HOST "for i in \$(seq 1 65); do [ -n \"\$(sudo find /data/cache -maxdepth 2 -name lru_db -newer /tmp/drill-meta-marker)\" ] && exit 0; sleep 1; done; exit 1"
 	check "LRU 索引已写盘" "$?" 0
-	ssh $EDGE_HOST "sudo python3 -c 'import json, sys; p = sys.argv[1]; d = json.load(open(p)); d[\"response_header_bytes\"] = \"AAAA\"; json.dump(d, open(p, \"w\"), indent=2)' $m"
-	on_exit "ssh $EDGE_HOST \"curl -s -o /dev/null -X PURGE -H 'Host: $HOST' 'http://127.0.0.1$p'\""
+	ssh -n $EDGE_HOST "sudo python3 -c 'import json, sys; p = sys.argv[1]; d = json.load(open(p)); d[\"response_header_bytes\"] = \"AAAA\"; json.dump(d, open(p, \"w\"), indent=2)' $m"
+	on_exit "ssh -n $EDGE_HOST \"curl -s -o /dev/null -X PURGE -H 'Host: $HOST' 'http://127.0.0.1$p'\""
 	info "改坏 meta 里的响应头, 重启 cache 清掉内存里的 meta"
 	svc $EDGE_HOST restart arescdn-cache
-	check "cache 读不出响应头(内部错误), 断开连接; 只有 1 台设备时换设备也没用, 返回 502" "$(code "$p")" 502
-	check "nginx 按连接错误换设备重试了" "$(attempts "$p")" "[2-9]"
-	check "cache 日志: 内部错误时断开连接" \
-		"$(ssh $EDGE_HOST "sudo grep -F 'drill-meta-$RUN' /data/log/arescdn-cache/arescdn-cache.log | grep -c 'close the connection so that edge retries'")" "[1-9]*"
+	check "cache 发现 meta 损坏, 淘汰后回源重新缓存(cache prerelease-13 起)" "$(req "$p" | cut -d' ' -f1-2)" "200 MISS"
+	check "cache 日志: 发现 meta 损坏" \
+		"$(ssh -n $EDGE_HOST "sudo grep -F 'drill-meta-$RUN' /data/log/arescdn-cache/arescdn-cache.log | grep -c 'corrupted meta'")" "[1-9]*"
+	check "之后正常命中" "$(req "$p" | cut -d' ' -f1-2)" "200 HIT"
 	eval "${RESTORE[${#RESTORE[@]}-1]}"
 	restored
-	check "URL 刷新(PURGE)后恢复" "$(req "$p" | cut -d' ' -f1-2)" "200 MISS"
 }
 
 # ===========================================================================
