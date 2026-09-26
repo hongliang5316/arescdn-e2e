@@ -3,16 +3,16 @@
 #
 # 在控制面机器上执行(先执行过 setup.sh): sudo ./run-tests.sh [组...]
 #   basic    回源链路 / 缓存规则 / 大文件与 Range / 刷新 / 预热
-#   follow   302 跟随
+#   follow   301 / 302 跟随
 #   shard    分片
-#   shard302 分片 + 302 跟随
+#   shard302 分片 + 301 / 302 跟随
 #   share    共享缓存域名(SHARE_HOST 共享 HOST 的缓存)
 #   stats    统计: edge -> cache-manager -> Kafka -> metric-consumer -> ClickHouse -> api 统计接口
 #   不带参数时执行全部.
 #
 # 链路: 本机 curl -> 边缘层节点(EDGE) -> 回源层节点(ORIGIN_LAYER_IP) -> 本机测试源站 :8081
 # 环境配置见 lab.env; 测试域名组的配置通过 tools/cdnapi.sh 调用 API 修改,
-# 每组结束时恢复本组改过的配置, 退出时 302 跟随、分片关闭, 共享缓存域名恢复为 HOST.
+# 每组结束时恢复本组改过的配置, 退出时跟随、分片关闭, 共享缓存域名恢复为 HOST.
 set -u
 
 BASE=$(cd "$(dirname "$0")" && pwd)
@@ -191,9 +191,9 @@ CONFIG_SETTLE_SECS=11
 follow_to() {
 	check "API 设置 acc_follow302_max=$1" "$(set_follow $1)" ok
 	if [ "$1" = 0 ]; then
-		wait_until "302 跟随关闭生效" probe_code /302/rel 302
+		wait_until "跟随关闭生效" probe_code /302/rel 302
 	else
-		wait_until "302 跟随开启生效" probe_code /302/rel 200
+		wait_until "跟随开启生效" probe_code /302/rel 200
 	fi
 	sleep $CONFIG_SETTLE_SECS
 }
@@ -363,12 +363,14 @@ test_basic() {
 
 # ===========================================================================
 test_follow() {
-	section "302 跟随关闭时"
+	section "跟随关闭时"
 	follow_to 0
 	fetch "/302/rel?r=$RUN-off"
 	check "302 原样返回" "$CODE $(hdr Location)" "302 /dyn/rel-final"
+	fetch "/301/rel?r=$RUN-off"
+	check "301 原样返回" "$CODE $(hdr Location)" "301 /dyn/301-final"
 
-	section "302 跟随(acc_follow302_max=3)"
+	section "301 / 302 跟随(acc_follow302_max=3)"
 	follow_to 3
 
 	mark
@@ -416,11 +418,29 @@ test_follow() {
 	check "第三方: 不携带 Authorization" "$(jget .headers.Authorization)" "<无>"
 
 	fetch "/301/rel?r=$RUN"
-	check "301 不跟随" "$CODE $(hdr Location)" "301 /dyn/301-final"
+	check "301 相对地址: 200, 返回跳转后的内容" "$CODE $(body)" "200 dyn uri=/dyn/301-final *"
+	fetch "/mix/chain/3?r=$RUN"
+	check "301 / 302 混合连跳 3 次(等于上限): 200" "$CODE $(body)" "200 dyn uri=/dyn/mix-final *"
+	mark
+	fetch "/mix/chain/4?r=$RUN"
+	check "混合连跳 4 次(超上限): 返回最后一跳的 301" "$CODE $(hdr Location)" "301 /dyn/mix-final"
+	check "混合连跳 4 次: 源站收到 4 次请求" "$(hits 'GET /mix/chain/')" 4
+	fetch "/301/none?r=$RUN"
+	check "301 没有 Location: 返回 301" "$CODE" 301
+	check "301 没有 Location: 响应也没有 Location" "$(hdr Location)" ""
+	mark
+	fetch "/301/third-private?r=$RUN"
+	check "301 跳到内网地址: 不跟随, 返回 301" "$CODE $(hdr Location)" "301 http://$ORIGIN_IP:8082/dyn/third301"
+	check "301 跳到内网地址: 没有访问内网" "$(hits ' 8082 "')" 0
+
 	fetch "/307/rel?r=$RUN"
 	check "307 不跟随" "$CODE $(hdr Location)" "307 /dyn/307-final"
+	fetch "/308/rel?r=$RUN"
+	check "308 不跟随" "$CODE $(hdr Location)" "308 /dyn/308-final"
 	fetch "/302/rel?r=$RUN-post" -X POST -d a=1
 	check "POST 不跟随" "$CODE" 302
+	fetch "/301/rel?r=$RUN-post" -X POST -d a=1
+	check "POST 不跟随 301" "$CODE" 301
 	fetch "/302/rel?r=$RUN-head" -I
 	check "HEAD 跟随: 200" "$CODE" 200
 
@@ -568,13 +588,13 @@ test_shard() {
 
 # ===========================================================================
 test_shard302() {
-	section "分片 + 302 跟随关闭"
+	section "分片 + 跟随关闭"
 	shard_to 512KB "bytes=0-524287"
 	follow_to 0
 	fetch "/302/big?r=$RUN-off"
 	check "302 原样返回" "$CODE $(hdr Location)" "302 /static/10m.bin"
 
-	section "分片 512KB + 302 跟随(acc_follow302_max=3)"
+	section "分片 512KB + 301 / 302 跟随(acc_follow302_max=3)"
 	follow_to 3
 
 	local U="/302/big?r=$RUN"
@@ -611,6 +631,16 @@ test_shard302() {
 
 	fetch "/302/big-abs?r=$RUN"
 	check "绝对地址(本域名)跳到大文件: 200 内容一致" "$CODE $(body_md5)" "200 $BIGMD5"
+
+	U="/302/big-301?r=$RUN"
+	mark
+	fetch "$U"
+	check "301 跳到 10MB 文件: 200 内容一致" "$CODE $(body_md5)" "200 $BIGMD5"
+	check "301: 每个分片都先请求 301 地址(20 次)" "$(hits "GET $U ")" 20
+	check "301: 跳转后按 20 片回源, 区间正确且不重复" "$(same "$(ranges 'GET /static/10m.bin HTTP')" "$(expect_chunks $BIGSZ $CS)")" ok
+	mark
+	fetch "$U"
+	check "301: 再次请求 HIT 内容一致, 不回源" "$(hdr X-Cache-Status) $(body_md5) $(hits "GET $U ")" "HIT $BIGMD5 0"
 
 	U="/302/norange?r=$RUN"
 	mark
@@ -651,7 +681,7 @@ test_shard302() {
 	fi
 	info "302 目标在两个大小相同的文件间交替: $CODE $r"
 
-	# 恢复本组改过的配置, 后面的组从 302 跟随和分片都关闭的状态开始
+	# 恢复本组改过的配置, 后面的组从跟随和分片都关闭的状态开始
 	section "分片 + 302: 恢复"
 	follow_to 0
 	shard_to 0 -
@@ -946,7 +976,7 @@ test_stats() {
 # ===========================================================================
 echo "AresCDN 核心功能测试 run=$RUN edge=$EDGE host=$HOST groups=[$TEST_GROUPS]"
 
-section "准备: 关闭 302 跟随和分片"
+section "准备: 关闭跟随和分片"
 follow_to 0
 shard_to 0 -
 
@@ -962,7 +992,7 @@ for g in $TEST_GROUPS; do
 	esac
 done
 
-section "恢复: 关闭 302 跟随和分片"
+section "恢复: 关闭跟随和分片"
 follow_to 0
 shard_to 0 -
 
