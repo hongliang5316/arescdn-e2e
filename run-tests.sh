@@ -856,6 +856,8 @@ test_errcode() {
 	check "404: 第二次命中缓存" "$(twice /err/404/a-$RUN)" "HIT 同一响应"
 	check "404: 只回源 1 次" "$(hits "GET /err/404/a-$RUN ")" 1
 	check "没配的 502: 不缓存" "$(twice /err/502/a-$RUN)" "MISS 重新回源"
+	fetch /err/502/once-$RUN
+	check "没缓存的 5xx: 源站只收到 1 次(edge 不在 5xx 时换 cache 设备重试)" "$(hits "GET /err/502/once-$RUN ")" 1
 	fetch /err/404/head-$RUN -I
 	check "HEAD 的 404 也缓存(cache 把 HEAD 当 GET), 之后 GET 命中" "$(again /err/404/head-$RUN "$(hdr X-Origin-Seq)")" "HIT 同一响应"
 	check "POST 的 404 不缓存" "$(twice /err/404/post-$RUN -d x)" "MISS 重新回源"
