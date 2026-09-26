@@ -16,6 +16,7 @@ curl(控制面机器) ──> 边缘层节点 ──> 回源层节点 ──> �
 | `setup.sh` | 初始化环境：生成测试文件、启动测试源站、创建测试域名组，可重复执行 |
 | `lab.env.example` | 环境配置模板，`setup.sh` 复制成 `lab.env` 并填上域名组 ID（`lab.env` 不提交） |
 | `origin/` | 测试源站：openresty 容器（host 网络），各种测试路径定义在 `nginx.conf` |
+| `drill/drill.sh` | 故障演练：停掉 CDN 组件看请求表现，在本机执行，见"故障演练"一节 |
 | `tools/cdnapi.sh` | 调用 AresCDN API，用 admin 的 token 签名鉴权 |
 | `results/` | 建议把测试输出保存在这里（不提交） |
 
@@ -43,8 +44,9 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
   - 每个响应带 `X-Origin-Seq`（全局递增），同一 URL 两次序号相同说明命中了缓存。
   - 访问日志 `origin/logs/access.log` 记录来源 IP、Host、Range，脚本据此统计回源次数和分片区间。
   - `/err/<状态码>[/任意后缀]` 返回该状态码，`?cc=<Cache-Control>` 带上这个头，`?cookie=1` 带 `Set-Cookie`（值里有序号）。
+  - 源站故障：`/slow/<秒>` 等这么久再返回；`/reset` 连上就断开、不返回响应；`/truncate` 声明 1000 字节、只发 100 字节就断开（带 `max-age=3600`）。
   - `origin/nginx.conf` 是单文件挂载进容器的，更新后要 `docker restart arescdn-origin-test`。
-- 脚本会通过 API 修改 `HOST` 的跟随次数、分片大小、错误码缓存规则，以及 `SHARE_HOST` 的共享缓存域名；每组结束时恢复本组的改动，退出时恢复默认（跟随、分片关闭，共享缓存域名为 `HOST`，错误码缓存规则清空）。
+- 脚本会通过 API 修改 `HOST` 的跟随次数、分片大小、错误码缓存规则、回源端口，以及 `SHARE_HOST` 的共享缓存域名；每组结束时恢复本组的改动，退出时恢复默认（跟随、分片关闭，共享缓存域名为 `HOST`，错误码缓存规则清空，回源配置恢复为 fault 组改之前的）。
 - 统计里的流量是计费流量：每个请求 `floor(发出的字节数 × billing_coef)`。api 创建域名组时 `billing_coef` 默认为 1.05，所以统计流量比实际多 5%。
 - 配置从修改到所有节点进程生效要等缓存过期（cache-manager 5 秒，edge 进程内和节点共享内存各 5 秒）。脚本探测到新配置生效后，再等 11 秒才继续。
 
@@ -58,6 +60,7 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 | shard302 | 分片 + 301 / 302 跟随：跳到大文件后按分片回源、每片都重新跟随（302 和 301 各一组，301 的结果同样被缓存）；各种 Range；多跳、超上限；本域名绝对地址；目标不支持 Range、目标 404；HEAD；跳到外网大文件（阿里云镜像）和 httpbin 小文件（越界 Range 返回 416 的不规范源站） |
 | share | 共享缓存域名：两个域名互相命中、回源用各自的配置；Range；从任一域名提交 URL 刷新 / 目录刷新，另一个域名都更新；取消共享后各自缓存 |
 | errcode | 错误码缓存（测试源站 `/err/<状态码>`）：404 第二次命中、只回源 1 次，没配的状态码不缓存；HEAD 缓存、POST 不缓存；目录 / 后缀规则只对匹配的路径生效，同一状态码按优先级高的规则；过期后重新回源；缓存时间以规则为准（不看源站 `max-age`）；带 `Set-Cookie` 不缓存（4xx 和 5xx）；4xx 遵守 `no-store` / `no-cache` / `private`，5xx 忽略；只清边缘层后回源层命中、源站不再收到请求；边缘层扣掉回源层带来的 `Age`；URL 刷新清掉缓存的 404 |
+| fault | 源站故障：超过回源读超时（从 `HOST` 的回源配置读取）时约在超时时间返回 504、源站只收到 1 次，配了 `504=60` 后第二次直接返回缓存的 504；连上就断开时返回 502，源站最多收到 2 次（回源开了 keepalive，复用的连接被断开时 nginx 会在新连接上再试一次）；响应到一半断开时客户端收到残缺的响应、不缓存；回源端口连不上（临时改成没有监听的 `DEAD_PORT`）时 2 秒内返回 502 |
 | stats | 统计：发一批组成已知的请求（HIT / MISS、共享域名、404 / 206 / 416 / 302、HEAD / POST、10MB 文件、客户端中途断开），窗口内再做一次 URL 刷新和预热。ClickHouse 里按域名 / 方法 / 状态码 / 缓存状态 / 是否中断分组的请求数与实际一致；刷新预热不计入；节点、设备、域名组 ID、协议正确；回源层单独记录；计费流量等于客户端收到的字节数乘以 `billing_coef`；耗时合理。api 的 request_count（含 5 分钟粒度、按域名组、共享域名）、hit_rate（含 HIT / MISS 流量和流量命中率）、status_code_ratio、error_rate、client_abort_rate、region_isp_distribution、traffic、bandwidth、ttfb、request_time 与实际或 ClickHouse 一致；排行接口 domain_top、node_top（含 layer=source）与上面的接口一致 |
 
 stats 组的做法：统计按分钟聚合，脚本等到新的一分钟开始才发请求，时间窗口按分钟对齐，窗口内只有本组的请求。所以执行期间不能有其它程序访问 `HOST` / `SHARE_HOST`。发完请求后等数据写进 ClickHouse，再多等 12 秒（每个 nginx worker 至少再上报一轮），这样多算的请求也会被发现。这一组约 2 分钟。
@@ -68,6 +71,26 @@ stats 组没有覆盖：https / QUIC（测试域名没有配证书，本机 curl
 
 - 对没缓存过的文件发 HEAD 时，源站收到的分片请求数（HEAD 会触发按分片把整个文件拉一遍来填充缓存）。
 - 302 目标在两个大小相同、内容不同的文件之间交替时，分片会拼接成错误的文件。这是已知限制：同一次拉取中分片之间只校验文件总大小，决定以源站每次返回的跳转地址为准。
+
+## 故障演练（drill/drill.sh）
+
+停掉 CDN 的组件，看请求怎么表现，然后恢复。要在能 ssh 到 `edge01`、`edge02`、`api-web-db` 的机器上执行（本机），不是在控制面机器上；会短暂停止服务，不要在有真实流量、或者 e2e / arescdn-load 运行时执行。可以在 macOS 自带的 bash 3.2 下运行。
+
+```bash
+ssh ubuntu 'cat /root/git/arestech/arescdn-e2e/drill/drill.sh' | bash -s -- all
+```
+
+只跑其中几个场景：把 `all` 换成场景名，如 `cache-down layer2-down`。每个场景结束时恢复；中途退出时由 EXIT 钩子恢复。
+
+| 场景 | 做法 | 期望 |
+|---|---|---|
+| cache-down | 停掉边缘层节点的 cache | 返回 502，nginx 换设备重试（每个节点只有 1 台时重试的还是它）；恢复后 200 |
+| layer2-down | 停掉回源层节点的 nginx | 已缓存的照常命中；没缓存的 2 秒内返回 502；恢复后 200 |
+| cache-manager-down | 停掉边缘层节点的 cache-manager 20 秒 | 请求照常，edge 继续用旧配置 |
+| redis-down | 停掉控制面的 Redis 20 秒 | 请求照常，两层都继续用旧配置 |
+| meta-corrupt | 缓存一个文件，等 LRU 索引写盘后，改坏它 meta 里的响应头，重启 cache | cache 读不出响应头（内部错误）时断开连接，nginx 换设备重试；只有 1 台设备时返回 502；PURGE 后恢复 |
+
+meta-corrupt 要等 LRU 写盘：cache 每 60 秒把 LRU 索引写盘一次，关闭时不写；写盘前重启的话，新进程不认识这个文件，会直接当作未命中重新拉取。
 
 ## 已知问题（与测试相关）
 

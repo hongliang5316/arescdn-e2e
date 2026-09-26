@@ -8,12 +8,14 @@
 #   shard302 分片 + 301 / 302 跟随
 #   share    共享缓存域名(SHARE_HOST 共享 HOST 的缓存)
 #   errcode  错误码缓存
+#   fault    源站故障: 超时、连上就断开、响应到一半断开、连不上
 #   stats    统计: edge -> cache-manager -> Kafka -> metric-consumer -> ClickHouse -> api 统计接口
 #   不带参数时执行全部.
 #
 # 链路: 本机 curl -> 边缘层节点(EDGE) -> 回源层节点(ORIGIN_LAYER_IP) -> 本机测试源站 :8081
 # 环境配置见 lab.env; 测试域名组的配置通过 tools/cdnapi.sh 调用 API 修改,
-# 每组结束时恢复本组改过的配置, 退出时跟随、分片关闭, 共享缓存域名恢复为 HOST, 错误码缓存规则清空.
+# 每组结束时恢复本组改过的配置, 退出时跟随、分片关闭, 共享缓存域名恢复为 HOST, 错误码缓存规则清空,
+# 回源配置恢复为 fault 组改之前的.
 set -u
 
 BASE=$(cd "$(dirname "$0")" && pwd)
@@ -33,7 +35,7 @@ API=$BASE/tools/cdnapi.sh
 DIR=$BASE/origin
 LOG=$DIR/logs/access.log
 RUN=$(date +%Y%m%d%H%M%S)
-TEST_GROUPS=${*:-basic follow shard shard302 share errcode stats}
+TEST_GROUPS=${*:-basic follow shard shard302 share errcode fault stats}
 T=$(mktemp -d)
 
 PASS=0
@@ -277,11 +279,30 @@ again() {
 # 只清边缘层节点的缓存: edge 允许内网地址直接发 PURGE, 只作用于本节点, 不经过 dispatcher
 purge_edge() { curl -s -o /dev/null -w '%{http_code}' -X PURGE -H "Host: $HOST" "http://$EDGE$1"; }
 
+# fetch_timed PATH [curl 参数...]: 同 fetch, 另外记下耗时 $SECS(秒)和 curl 的退出码 $RC
+fetch_timed() {
+	local path=$1
+	shift
+	: >$T/hdr
+	: >$T/body
+	SECS=$(curl -s -m 60 -o $T/body -D $T/hdr -w '%{time_total}' -H "Host: $HOST" "$@" "http://$EDGE$path")
+	RC=$?
+	CODE=$(awk 'NR==1{print $2}' $T/hdr)
+}
+# between 值 下限 上限: 在范围内输出 ok, 否则输出这个值
+between() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN{if (v >= lo && v <= hi) print "ok"; else print v}'; }
+
+# 回源配置(JSON). fault 组改之前存在 ORIGIN_SAVED, 退出时恢复
+ORIGIN_SAVED=
+origin_json() { $API GET /api/cdn/v1/domaingroups | jq -c --arg id "$DG" '.data.domain_group_list[] | select(.unique_id == $id) | .origin'; }
+set_origin() { api PATCH /api/cdn/v1/domaingroups "{\"unique_id\":\"$DG\",\"origin\":$1}"; }
+
 cleanup() {
 	set_follow 0 >/dev/null
 	set_shard 0 >/dev/null
 	set_as_domain $HOST >/dev/null
 	set_errcode '[]' >/dev/null
+	[ -n "$ORIGIN_SAVED" ] && set_origin "$ORIGIN_SAVED" >/dev/null
 	rm -rf $T
 }
 trap cleanup EXIT
@@ -924,6 +945,68 @@ test_errcode() {
 }
 
 # ===========================================================================
+# 源站故障, 用测试源站的 /slow/<秒>、/reset、/truncate; 连不上时临时把回源端口改成 DEAD_PORT.
+# 检查 CDN 每一层都不重试(源站只收到 1 次)、残缺的响应不缓存、源站超时的 504 可以用错误码缓存挡住
+DEAD_PORT=8089
+
+test_fault() {
+	local rt slow p
+	rt=$(origin_json | jq -r .timeouts.read_timeout)
+	slow=$((rt + 1))
+
+	section "源站故障: 超时(回源读超时 $rt 秒, 源站 $slow 秒才响应)"
+	mark
+	p=/slow/$slow/a-$RUN
+	fetch_timed $p
+	check "返回 504" "$CODE" 504
+	check "约 $rt 秒返回: 超时后直接返回, 没有换设备再等一轮" "$(between $SECS $((rt - 1)) $((rt + 2)))" ok
+	sleep 2 # 源站 $slow 秒后才写访问日志
+	check "源站只收到 1 次" "$(hits "GET $p ")" 1
+
+	errcode_to "[
+		{\"rule_type\":\"directory\",\"rule_path_list\":[\"/slow/$slow/c/\"],\"content\":\"504=60\",\"priority\":2},
+		{\"rule_type\":\"all\",\"rule_path_list\":[\"*\"],\"content\":\"404=60\",\"priority\":1}]" on
+	p=/slow/$slow/c/a-$RUN
+	fetch_timed $p
+	check "配了 504=60: 第一次等到超时, 返回 504" "$CODE $(between $SECS $((rt - 1)) $((rt + 2)))" "504 ok"
+	fetch_timed $p
+	check "配了 504=60: 第二次直接返回缓存的 504" "$CODE $(hdr X-Cache-Status) $(between $SECS 0 1)" "504 HIT ok"
+	sleep 2
+	check "源站只收到 1 次" "$(hits "GET $p ")" 1
+	errcode_to '[]' off
+
+	section "源站故障: 连上就断开"
+	p=/reset/a-$RUN
+	fetch $p
+	check "返回 502" "$CODE" 502
+	sleep 1
+	# 回源开了 keepalive: 复用的空闲连接没收到响应头就被断开时, nginx 当成连接过期, 在新连接上再试一次
+	check "源站最多收到 2 次(只有回源这一跳在复用连接被断开时再试一次)" "$(hits "GET $p ")" "[12]"
+
+	section "源站故障: 响应到一半断开(声明 1000 字节, 只发 100 字节, 带 max-age=3600)"
+	p=/truncate/a-$RUN
+	fetch_timed $p
+	check "客户端收到 100 字节后连接中断(curl 退出码 18)" "$CODE $(wc -c <$T/body) $RC" "200 100 18"
+	fetch_timed $p
+	check "残缺的响应没有被缓存: 第二次仍是 MISS" "$(hdr X-Cache-Status)" MISS
+	sleep 1
+	check "源站收到 2 次" "$(hits "GET $p ")" 2
+
+	section "源站故障: 连不上(回源端口改成没有监听的 $DEAD_PORT)"
+	check "本机 $DEAD_PORT 端口没有监听" "$(ss -ltnH "sport = :$DEAD_PORT" | wc -l)" 0
+	ORIGIN_SAVED=$(origin_json)
+	check "API 把回源端口改成 $DEAD_PORT" "$(set_origin "$(echo "$ORIGIN_SAVED" | jq -c ".origin_info_list[0].port = $DEAD_PORT")")" ok
+	wait_until "回源端口修改生效" probe_code /dyn/fault 502
+	sleep $CONFIG_SETTLE_SECS
+	fetch_timed /dyn/dead-$RUN
+	check "很快返回 502: 不等超时、不重试" "$CODE $(between $SECS 0 2)" "502 ok"
+	check "API 恢复回源配置" "$(set_origin "$ORIGIN_SAVED")" ok
+	wait_until "回源恢复" probe_code /dyn/fault 200
+	sleep $CONFIG_SETTLE_SECS
+	ORIGIN_SAVED=
+}
+
+# ===========================================================================
 # 统计: edge 每个 worker 按分钟聚合, 每 10 秒上报本机 cache-manager -> Kafka -> metric-consumer -> ClickHouse t_cdn_metrics.
 # 本组从新的一分钟开始发请求, 窗口内只有本组的请求(期间不能有其它程序访问 HOST / SHARE_HOST), 所以可以精确比对.
 CK_CONTAINER=${CLICKHOUSE_CONTAINER:-arescdn-clickhouse}
@@ -1122,6 +1205,7 @@ for g in $TEST_GROUPS; do
 	shard302) test_shard302 ;;
 	share) test_share ;;
 	errcode) test_errcode ;;
+	fault) test_fault ;;
 	stats) test_stats ;;
 	*) echo "未知的组: $g" && exit 2 ;;
 	esac
