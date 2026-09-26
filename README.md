@@ -42,7 +42,9 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 - 测试源站：8081 是主源站，8082 模拟内网第三方地址（验证 301 / 302 跟随的内网拦截）。
   - 每个响应带 `X-Origin-Seq`（全局递增），同一 URL 两次序号相同说明命中了缓存。
   - 访问日志 `origin/logs/access.log` 记录来源 IP、Host、Range，脚本据此统计回源次数和分片区间。
-- 脚本会通过 API 修改 `HOST` 的跟随次数、分片大小，以及 `SHARE_HOST` 的共享缓存域名；每组结束时恢复本组的改动，退出时恢复默认（跟随、分片关闭，共享缓存域名为 `HOST`）。
+  - `/err/<状态码>[/任意后缀]` 返回该状态码，`?cc=<Cache-Control>` 带上这个头，`?cookie=1` 带 `Set-Cookie`（值里有序号）。
+  - `origin/nginx.conf` 是单文件挂载进容器的，更新后要 `docker restart arescdn-origin-test`。
+- 脚本会通过 API 修改 `HOST` 的跟随次数、分片大小、错误码缓存规则，以及 `SHARE_HOST` 的共享缓存域名；每组结束时恢复本组的改动，退出时恢复默认（跟随、分片关闭，共享缓存域名为 `HOST`，错误码缓存规则清空）。
 - 统计里的流量是计费流量：每个请求 `floor(发出的字节数 × billing_coef)`。api 创建域名组时 `billing_coef` 默认为 1.05，所以统计流量比实际多 5%。
 - 配置从修改到所有节点进程生效要等缓存过期（cache-manager 5 秒，edge 进程内和节点共享内存各 5 秒）。脚本探测到新配置生效后，再等 11 秒才继续。
 
@@ -55,6 +57,7 @@ sudo ./run-tests.sh | tee results/$(date +%Y%m%d-%H%M%S).log
 | shard | 分片（512KB）：分片区间、每片只回源一次；Range 只回源需要的分片（片内、跨片、末尾、越界 416）；部分缓存后只补缺的分片；边界文件（整 2 片、1 片多 1 字节、小于 1 片、空文件）；源站不支持 Range；404；HEAD；不缓存的文件不分片；缓存部分分片后源站换成同样大小的新版本不拼接；修改分片大小只对新文件生效；关闭分片后旧文件仍可命中 |
 | shard302 | 分片 + 301 / 302 跟随：跳到大文件后按分片回源、每片都重新跟随（302 和 301 各一组，301 的结果同样被缓存）；各种 Range；多跳、超上限；本域名绝对地址；目标不支持 Range、目标 404；HEAD；跳到外网大文件（阿里云镜像）和 httpbin 小文件（越界 Range 返回 416 的不规范源站） |
 | share | 共享缓存域名：两个域名互相命中、回源用各自的配置；Range；从任一域名提交 URL 刷新 / 目录刷新，另一个域名都更新；取消共享后各自缓存 |
+| errcode | 错误码缓存（测试源站 `/err/<状态码>`）：404 第二次命中、只回源 1 次，没配的状态码不缓存；HEAD 缓存、POST 不缓存；目录 / 后缀规则只对匹配的路径生效，同一状态码按优先级高的规则；过期后重新回源；缓存时间以规则为准（不看源站 `max-age`）；带 `Set-Cookie` 不缓存（4xx 和 5xx）；4xx 遵守 `no-store` / `no-cache` / `private`，5xx 忽略；只清边缘层后回源层命中、源站不再收到请求；边缘层扣掉回源层带来的 `Age`；URL 刷新清掉缓存的 404 |
 | stats | 统计：发一批组成已知的请求（HIT / MISS、共享域名、404 / 206 / 416 / 302、HEAD / POST、10MB 文件、客户端中途断开），窗口内再做一次 URL 刷新和预热。ClickHouse 里按域名 / 方法 / 状态码 / 缓存状态 / 是否中断分组的请求数与实际一致；刷新预热不计入；节点、设备、域名组 ID、协议正确；回源层单独记录；计费流量等于客户端收到的字节数乘以 `billing_coef`；耗时合理。api 的 request_count（含 5 分钟粒度、按域名组、共享域名）、hit_rate（含 HIT / MISS 流量和流量命中率）、status_code_ratio、error_rate、client_abort_rate、region_isp_distribution、traffic、bandwidth、ttfb、request_time 与实际或 ClickHouse 一致；排行接口 domain_top、node_top（含 layer=source）与上面的接口一致 |
 
 stats 组的做法：统计按分钟聚合，脚本等到新的一分钟开始才发请求，时间窗口按分钟对齐，窗口内只有本组的请求。所以执行期间不能有其它程序访问 `HOST` / `SHARE_HOST`。发完请求后等数据写进 ClickHouse，再多等 12 秒（每个 nginx worker 至少再上报一轮），这样多算的请求也会被发现。这一组约 2 分钟。

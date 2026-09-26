@@ -7,12 +7,13 @@
 #   shard    分片
 #   shard302 分片 + 301 / 302 跟随
 #   share    共享缓存域名(SHARE_HOST 共享 HOST 的缓存)
+#   errcode  错误码缓存
 #   stats    统计: edge -> cache-manager -> Kafka -> metric-consumer -> ClickHouse -> api 统计接口
 #   不带参数时执行全部.
 #
 # 链路: 本机 curl -> 边缘层节点(EDGE) -> 回源层节点(ORIGIN_LAYER_IP) -> 本机测试源站 :8081
 # 环境配置见 lab.env; 测试域名组的配置通过 tools/cdnapi.sh 调用 API 修改,
-# 每组结束时恢复本组改过的配置, 退出时跟随、分片关闭, 共享缓存域名恢复为 HOST.
+# 每组结束时恢复本组改过的配置, 退出时跟随、分片关闭, 共享缓存域名恢复为 HOST, 错误码缓存规则清空.
 set -u
 
 BASE=$(cd "$(dirname "$0")" && pwd)
@@ -32,7 +33,7 @@ API=$BASE/tools/cdnapi.sh
 DIR=$BASE/origin
 LOG=$DIR/logs/access.log
 RUN=$(date +%Y%m%d%H%M%S)
-TEST_GROUPS=${*:-basic follow shard shard302 share stats}
+TEST_GROUPS=${*:-basic follow shard shard302 share errcode stats}
 T=$(mktemp -d)
 
 PASS=0
@@ -151,9 +152,10 @@ task_is() { [ "$(task_status "$1" "$2")" = "$3" ]; }
 # 而查询的截止时间是把当前时间截断到秒, 小数部分 >= 0.5 的任务在下一秒前都查不到
 task_done() { WAIT_TRIES=${3:-15} wait_until "$1 任务完成" task_is "$1" "$2" Success; }
 # refresh_order request_id: dispatcher 处理 URL 刷新时各节点完成的顺序, 如 "origin:lab02:Success edge:lab01:Success"
-# (取自 dispatcher 的 debug 日志 "Refresh done: 请求, 域名, 任务, 层级, 节点, 状态")
+# (取自 dispatcher 的 debug 日志 "Refresh done: 请求, 域名, 任务, 层级, 节点, 状态";
+#  机器非正常关机后日志里可能有 NUL 字节, 所以 grep -a)
 refresh_order() {
-	grep -h "Refresh done: $1" $(ls -t "$DISPATCHER_LOG_DIR"/* | head -1) |
+	grep -a -h "Refresh done: $1" $(ls -t "$DISPATCHER_LOG_DIR"/* | head -1) |
 		sed -E 's/.*Refresh done: [^,]+, [^,]+, [^,]+, ([a-z]+), ([^,]+), ([A-Za-z]+).*/\1:\2:\3/' | tr '\n' ' ' | sed 's/ $//'
 }
 UUID_GLOB="????????-????-????-????-????????????"
@@ -232,10 +234,54 @@ share_to() { # share_to 共享缓存域名(空表示不共享) on|off
 	sleep $CONFIG_SETTLE_SECS
 }
 
+set_errcode() { api PATCH /api/cdn/v1/domaingroups/errorpage_cache "{\"unique_id\":\"$DG\",\"rule_list\":$1}"; }
+# 规则是否生效: 新地址的 404 请求两次, 第二次 HIT 表示缓存 404(on), MISS 表示不缓存(off)
+errcode_is() {
+	local p="/err/404/probe-$RUN-$RANDOM"
+	fetch "$p"
+	fetch "$p"
+	if [ "$1" = on ]; then
+		[ "$(hdr X-Cache-Status)" = HIT ]
+	else
+		[ "$(hdr X-Cache-Status)" = MISS ]
+	fi
+}
+errcode_to() { # errcode_to 规则列表(JSON) on|off(404 是否缓存)
+	local desc="设置错误码缓存规则"
+	[ "$1" = "[]" ] && desc="清空错误码缓存规则"
+	check "API $desc" "$(set_errcode "$1")" ok
+	wait_until "$desc 生效" errcode_is "$2"
+	sleep $CONFIG_SETTLE_SECS
+}
+# twice 路径 [curl 参数...]: 请求两次, 输出第二次的缓存状态, 以及和第一次是不是同一个源站响应(X-Origin-Seq)
+twice() {
+	local seq
+	fetch "$@"
+	seq=$(hdr X-Origin-Seq)
+	fetch "$@"
+	if [ "$(hdr X-Origin-Seq)" = "$seq" ]; then
+		echo "$(hdr X-Cache-Status) 同一响应"
+	else
+		echo "$(hdr X-Cache-Status) 重新回源"
+	fi
+}
+# again 路径 序号: 再请求一次, 输出缓存状态, 以及是不是仍是这个序号的源站响应
+again() {
+	fetch "$1"
+	if [ "$(hdr X-Origin-Seq)" = "$2" ]; then
+		echo "$(hdr X-Cache-Status) 同一响应"
+	else
+		echo "$(hdr X-Cache-Status) 重新回源"
+	fi
+}
+# 只清边缘层节点的缓存: edge 允许内网地址直接发 PURGE, 只作用于本节点, 不经过 dispatcher
+purge_edge() { curl -s -o /dev/null -w '%{http_code}' -X PURGE -H "Host: $HOST" "http://$EDGE$1"; }
+
 cleanup() {
 	set_follow 0 >/dev/null
 	set_shard 0 >/dev/null
 	set_as_domain $HOST >/dev/null
+	set_errcode '[]' >/dev/null
 	rm -rf $T
 }
 trap cleanup EXIT
@@ -790,6 +836,92 @@ test_share() {
 }
 
 # ===========================================================================
+# 错误码缓存, 用测试源站的 /err/<状态码>. 规则按优先级从高到低:
+#   目录 /err/403/in/、/err/429/prio/: 403=60,429=60
+#   后缀 html: 405=60
+#   全部: 404=60,410=20,429=2,503=60
+ERRCODE_RULES='[
+	{"rule_type":"directory","rule_path_list":["/err/403/in/","/err/429/prio/"],"content":"403=60,429=60","priority":10},
+	{"rule_type":"file","rule_path_list":["html"],"content":"405=60","priority":5},
+	{"rule_type":"all","rule_path_list":["*"],"content":"404=60,410=20,429=2,503=60","priority":1}
+]'
+
+test_errcode() {
+	section "错误码缓存: 设置规则"
+	errcode_to "$ERRCODE_RULES" on
+	local p s ttl prio maxage id cc
+
+	section "错误码缓存: 基本"
+	mark
+	check "404: 第二次命中缓存" "$(twice /err/404/a-$RUN)" "HIT 同一响应"
+	check "404: 只回源 1 次" "$(hits "GET /err/404/a-$RUN ")" 1
+	check "没配的 502: 不缓存" "$(twice /err/502/a-$RUN)" "MISS 重新回源"
+	fetch /err/404/head-$RUN -I
+	check "HEAD 的 404 也缓存(cache 把 HEAD 当 GET), 之后 GET 命中" "$(again /err/404/head-$RUN "$(hdr X-Origin-Seq)")" "HIT 同一响应"
+	check "POST 的 404 不缓存" "$(twice /err/404/post-$RUN -d x)" "MISS 重新回源"
+
+	section "错误码缓存: 规则匹配、过期、优先级"
+	check "目录规则: /err/403/in/ 下的 403 缓存" "$(twice /err/403/in/a-$RUN)" "HIT 同一响应"
+	check "目录规则: 其它目录的 403 不缓存" "$(twice /err/403/out/a-$RUN)" "MISS 重新回源"
+	check "后缀规则: .html 的 405 缓存" "$(twice /err/405/a-$RUN.html)" "HIT 同一响应"
+	check "后缀规则: .txt 的 405 不缓存" "$(twice /err/405/a-$RUN.txt)" "MISS 重新回源"
+	fetch /err/429/ttl-$RUN
+	ttl=$(hdr X-Origin-Seq)
+	fetch /err/429/prio/a-$RUN
+	prio=$(hdr X-Origin-Seq)
+	fetch "/err/404/maxage-$RUN?cc=max-age%3D1"
+	maxage=$(hdr X-Origin-Seq)
+	check "429=2: 2 秒内命中" "$(again /err/429/ttl-$RUN $ttl)" "HIT 同一响应"
+	sleep 3
+	check "429=2: 过期后重新回源" "$(again /err/429/ttl-$RUN $ttl)" "MISS 重新回源"
+	check "优先级: 目录规则的 429=60 优先于全部规则的 429=2, 3 秒后仍命中" "$(again /err/429/prio/a-$RUN $prio)" "HIT 同一响应"
+	check "缓存时间以规则为准: 源站 max-age=1, 3 秒后仍命中" "$(again "/err/404/maxage-$RUN?cc=max-age%3D1" $maxage)" "HIT 同一响应"
+
+	section "错误码缓存: 源站响应头"
+	check "404 带 Set-Cookie: 不缓存" "$(twice "/err/404/cookie-$RUN?cookie=1")" "MISS 重新回源"
+	check "404 带 Set-Cookie: 拿到的是本次响应的 cookie" "$(hdr Set-Cookie)" "sid=$(hdr X-Origin-Seq); Path=/"
+	check "503 带 Set-Cookie: 不缓存" "$(twice "/err/503/cookie-$RUN?cookie=1")" "MISS 重新回源"
+	for cc in no-store no-cache private; do
+		check "404 带 Cache-Control: $cc: 不缓存" "$(twice "/err/404/cc-$cc-$RUN?cc=$cc")" "MISS 重新回源"
+	done
+	check "503 带 no-store, no-cache, private: 仍缓存(5xx 忽略这三个指令)" \
+		"$(twice "/err/503/cc-$RUN?cc=no-store,no-cache,private")" "HIT 同一响应"
+
+	section "错误码缓存: 回源层"
+	p=/err/404/layer-$RUN
+	mark
+	fetch $p
+	s=$(hdr X-Origin-Seq)
+	fetch $p
+	check "只清 $EDGE_NODE 的缓存" "$(purge_edge $p)" 204
+	check "再请求: $EDGE_NODE 回源, $ORIGIN_NODE 命中(同一个源站响应)" "$(again $p $s)" "MISS 同一响应"
+	check "源站只收到 1 次请求" "$(hits "GET $p ")" 1
+	p=/err/410/age-$RUN
+	fetch $p
+	s=$(hdr X-Origin-Seq)
+	sleep 12
+	check "410=20: 12 秒后只清 $EDGE_NODE 的缓存" "$(purge_edge $p)" 204
+	fetch $p
+	check "从 $ORIGIN_NODE 拿到的 410 带 Age(约 12 秒)" "$(hdr X-Cache-Status) $(hdr Age)" "MISS 1[123]"
+	sleep 12
+	check "$EDGE_NODE 扣掉 Age: 第 24 秒两层都已过期, 重新回源" "$(again $p $s)" "MISS 重新回源"
+
+	section "错误码缓存: URL 刷新"
+	p=/err/404/refresh-$RUN
+	fetch $p
+	s=$(hdr X-Origin-Seq)
+	check "刷新前命中" "$(again $p $s)" "HIT 同一响应"
+	id=$(submit_task refresh "{\"type\":\"file\",\"data_list\":[\"http://$HOST$p\"]}")
+	check "提交 URL 刷新" "$id" "$UUID_GLOB"
+	task_done refresh "$id"
+	check "刷新任务 Success, dispatcher 先刷回源层再刷边缘层" "$(task_status refresh "$id") $(refresh_order "$id")" "Success $ORDER_OK"
+	check "URL 刷新后重新回源" "$(again $p $s)" "MISS 重新回源"
+
+	section "错误码缓存: 恢复"
+	errcode_to '[]' off
+}
+
+# ===========================================================================
 # 统计: edge 每个 worker 按分钟聚合, 每 10 秒上报本机 cache-manager -> Kafka -> metric-consumer -> ClickHouse t_cdn_metrics.
 # 本组从新的一分钟开始发请求, 窗口内只有本组的请求(期间不能有其它程序访问 HOST / SHARE_HOST), 所以可以精确比对.
 CK_CONTAINER=${CLICKHOUSE_CONTAINER:-arescdn-clickhouse}
@@ -987,6 +1119,7 @@ for g in $TEST_GROUPS; do
 	shard) test_shard ;;
 	shard302) test_shard302 ;;
 	share) test_share ;;
+	errcode) test_errcode ;;
 	stats) test_stats ;;
 	*) echo "未知的组: $g" && exit 2 ;;
 	esac
