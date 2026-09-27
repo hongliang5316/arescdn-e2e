@@ -1131,15 +1131,21 @@ test_stats() {
 		"$(awk -v t="$ttfb" -v r="$rt" -v c="$cms" -v n="$n" 'BEGIN{print (0 < r && t <= r && r <= c + 2 * n) ? "ok" : "首字节 " t ", 请求 " r ", 客户端 " c}')" ok
 
 	section "统计: api 接口($HOST, 只统计边缘层)"
-	local d bytes hb mb
+	local d bytes hb mb s5 e5
 	d=$(stat_api request_count)
 	check "request_count: 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
 	d=$(stat_api request_count "domain=$SHARE_HOST&granularity=1min")
 	check "request_count($SHARE_HOST): 合计 $ns" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$ns"
 	d=$(stat_api request_count "domain_group_unique_id=$DG&granularity=1min")
 	check "request_count(按域名组 $DG): 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
+	# api 把区间首尾向下对齐到粒度, 首尾在同一个 5 分钟内时取这 5 分钟;
+	# 所以 5 分钟粒度会带上窗口前后同一段内的请求(比如改配置后的探测), 和 ClickHouse 按同样的区间比
+	s5=$((ST_S / 300 * 300)) e5=$((ST_E / 300 * 300))
+	[ $e5 -gt $s5 ] || e5=$((s5 + 300))
 	d=$(stat_api request_count "domain=$HOST&granularity=5min")
-	check "request_count(5 分钟粒度): 合计 $nh" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" "$nh"
+	check "request_count(5 分钟粒度): 与 ClickHouse 按 5 分钟对齐后的区间一致" "$(echo "$d" | jq '[.request_counts[].count // 0] | add')" \
+		"$(ck <<<"SELECT sum(request_count) FROM t_cdn_metrics WHERE layer = 'edge' AND domain = '$HOST'
+			AND time >= toDateTime($s5) AND time < toDateTime($e5)")"
 
 	d=$(stat_api hit_rate)
 	check "hit_rate: HIT / MISS 数" "$(echo "$d" | jq -r '[([.hit_rate_list[].hit_count // 0] | add), ([.hit_rate_list[].miss_count // 0] | add)] | join(" ")')" \
