@@ -8,7 +8,7 @@
 #   shard302 分片 + 301 / 302 跟随
 #   share    共享缓存域名(SHARE_HOST 共享 HOST 的缓存)
 #   errcode  错误码缓存
-#   fault    源站故障: 超时、连上就断开、响应到一半断开、连不上
+#   fault    源站故障: 超时、连上就断开、响应到一半断开、连不上, 多个源站时换源站
 #   stats    统计: edge -> cache-manager -> Kafka -> metric-consumer -> ClickHouse -> api 统计接口
 #   不带参数时执行全部.
 #
@@ -945,12 +945,43 @@ test_errcode() {
 }
 
 # ===========================================================================
-# 源站故障, 用测试源站的 /slow/<秒>、/reset、/truncate; 连不上时临时把回源端口改成 DEAD_PORT.
-# 检查 CDN 每一层都不重试(源站只收到 1 次)、残缺的响应不缓存、源站超时的 504 可以用错误码缓存挡住
+# 源站故障, 用测试源站的 /slow/<秒>、/reset、/truncate; 连不上时临时把回源端口改成 DEAD_PORT,
+# 多个源站时再加上第二个源站 HANG_PORT(默认 30 秒才响应, /err/<状态码> 直接返回).
+# 检查 CDN 每一层都不重试(源站只收到 1 次)、残缺的响应不缓存、源站超时的 504 可以用错误码缓存挡住;
+# 有多个源站时, 连不上或超时换下一个源站, 源站返回的 5xx 不换
 DEAD_PORT=8089
+HANG_PORT=8083
+ERRLOG=$DIR/logs/error.log
+
+# 第二个源站收到过这个路径的请求: 它的访问日志要等响应结束才写, 收到请求时先在 error.log 记一行
+origin2_got() { grep -qF "origin2 got $1," $ERRLOG; }
+probe_origin2() { local p="/dyn/fault2?probe=$RUN-$RANDOM"; fetch "$p"; origin2_got "$p"; }
+# 回源只用原来的源站: 很快返回 200, 第二个源站没收到
+probe_origin1() {
+	local p="/dyn/fault1?probe=$RUN-$RANDOM"
+	fetch_timed "$p"
+	[ "$CODE" = 200 ] && [ "$(between $SECS 0 2)" = ok ] && ! origin2_got "$p"
+}
+# via_origin2 路径 [curl 参数...]: 请求 路径-1、-2、-3, 直到第二个源站收到过. 它的权重是 100,
+# 按权重轮询偶尔也会先选原来的源站, 这时换个路径再试. 最后请求的路径在 $P
+via_origin2() {
+	local path=$1 i
+	shift
+	for i in 1 2 3; do
+		P=$path-$i
+		fetch_timed $P "$@"
+		origin2_got $P && return 0
+	done
+	return 1
+}
+# origin_with 源站列表(JSON): 改之前的回源配置换掉源站列表
+origin_with() { echo "$ORIGIN_SAVED" | jq -c --argjson l "$1" '.origin_info_list = $l'; }
+# hits_on 端口 模式: 同 hits, 只算这个端口收到的(几个源站的访问日志写在同一个文件里)
+hits_on() { since_mark | grep -F " $1 \"" | grep -cF -- "$2"; }
+acc_read_timeout() { $API GET /api/cdn/v1/domaingroups | jq -r --arg id "$DG" '.data.domain_group_list[] | select(.unique_id == $id) | .acc_timeouts.origin_timeouts.read_timeout'; }
 
 test_fault() {
-	local rt slow p
+	local rt slow p i codes max o1 op dead hang art s
 	rt=$(origin_json | jq -r .timeouts.read_timeout)
 	slow=$((rt + 1))
 
@@ -1000,8 +1031,56 @@ test_fault() {
 	sleep $CONFIG_SETTLE_SECS
 	fetch_timed /dyn/dead-$RUN
 	check "很快返回 502: 不等超时、不重试" "$CODE $(between $SECS 0 2)" "502 ok"
+
+	# 有问题的源站权重设成 100: 按权重轮询, 几乎每个请求都先选到它
+	o1=$(echo "$ORIGIN_SAVED" | jq -c '.origin_info_list[0] | .weight = 1')
+	op=$(echo "$o1" | jq -r .port)
+	dead=$(echo "$o1" | jq -c ".port = $DEAD_PORT | .weight = 100")
+	hang=$(echo "$o1" | jq -c ".port = $HANG_PORT | .weight = 100")
+
+	section "源站故障: 两个源站, 一个连不上($DEAD_PORT, 权重 100)"
+	check "API 改成两个源站: $DEAD_PORT 和原来的源站" "$(set_origin "$(origin_with "[$dead, $o1]")")" ok
+	wait_until "两个源站生效" probe_code /dyn/fault 200
+	sleep $CONFIG_SETTLE_SECS
+	mark
+	codes= max=0
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		fetch_timed /dyn/two-$RUN-$i
+		codes="$codes $CODE"
+		max=$(awk -v a=$max -v b=$SECS 'BEGIN{print (b > a) ? b : a}')
+	done
+	check "10 个没缓存的请求都返回 200: 连不上时换到另一个源站" "$codes" "$(printf ' 200%.0s' {1..10})"
+	check "都在 2 秒内返回" "$(between $max 0 2)" ok
+	sleep 1
+	check "原来的源站每个请求只收到 1 次" "$(hits_on $op "GET /dyn/two-$RUN-")" 10
+
+	section "源站故障: 两个源站, 一个超时($HANG_PORT, 权重 100, 30 秒才响应)"
+	check "本机 $HANG_PORT 端口在监听(测试源站的第二个源站)" "$(ss -ltnH "sport = :$HANG_PORT" | wc -l)" "[1-9]*"
+	check "API 改成两个源站: $HANG_PORT 和原来的源站" "$(set_origin "$(origin_with "[$hang, $o1]")")" ok
+	WAIT_TRIES=15 wait_until "两个源站生效" probe_origin2
+	sleep $CONFIG_SETTLE_SECS
+	mark
+	via_origin2 /dyn/hang-$RUN
+	check "先试第二个源站, 约 $rt 秒(回源读超时)后换原来的源站, 返回 200" \
+		"$(origin2_got $P && echo 试了) $CODE $(between $SECS $((rt - 1)) $((rt + 3)))" "试了 200 ok"
+	sleep 1
+	check "原来的源站只收到 1 次" "$(hits_on $op "GET $P ")" 1
+
+	# 两个源站加起来超过回源层 cache 原来等回源端口的时间: 回源层的读超时要按换源站加长, 否则 cache 先超时返回 504
+	art=$(acc_read_timeout)
+	s=$((art - rt + 2))
+	via_origin2 /slow/$s/hang-$RUN
+	check "第二个源站超时($rt 秒) + 原来的源站 $s 秒才响应, 超过回源层 cache 原来的读超时($art 秒), 仍返回 200" \
+		"$(origin2_got $P && echo 试了) $CODE $(between $SECS $((rt + s - 1)) $((rt + s + 3)))" "试了 200 ok"
+
+	mark
+	via_origin2 /err/503/hang-$RUN
+	check "第二个源站返回 503: 原样返回, 不换源站" "$(origin2_got $P && echo 试了) $CODE $(body)" "试了 503 origin2 err status=503"
+	sleep 1
+	check "原来的源站没有收到" "$(hits_on $op "GET $P ")" 0
+
 	check "API 恢复回源配置" "$(set_origin "$ORIGIN_SAVED")" ok
-	wait_until "回源恢复" probe_code /dyn/fault 200
+	wait_until "回源恢复" probe_origin1
 	sleep $CONFIG_SETTLE_SECS
 	ORIGIN_SAVED=
 }
